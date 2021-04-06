@@ -1,0 +1,324 @@
+<style>
+    body {
+        background-color: #272726;
+        color: #fff;
+    }
+</style>
+<script src="//cdnjs.cloudflare.com/ajax/libs/aspnet-signalr/1.1.4/signalr.min.js"></script>
+<div class="container">
+    <div class="row">&nbsp;</div>
+    <div class="row">
+        <div class="col-2">User</div>
+        <div class="col-4"><input type="text" id="userInput" value="admin" /></div>
+    </div>
+    <div class="row">&nbsp;</div>
+    <div class="row">
+        <div class="col-6">
+            <input type="button" id="lobbyConnectionButton" value="Connect to lobby" />
+            <input type="button" id="requestMatchButton" value="Request Matchmaking & server" />
+            <input type="button" id="requestLogStreamButton" value="Subscribe to Log Stream" />
+            <input type="button" id="lobbyDisconnectButton" value="Disconnect from lobby" />
+        </div>
+    </div>
+</div>
+<div class="row">
+    <div class="col-12">
+        <hr />
+    </div>
+</div>
+
+<script>
+    const baseUri = 'https://localhost:44337'
+    //const baseUri = 'https://genesys-multiplayer-lobby-svc-dev.azurewebsites.net'
+    //const baseUri = 'https://genesys-multiplayer-lobby-svc.azurewebsites.net'
+    //const baseUri = 'https://3589c1733f92.ngrok.io'
+    const hubUri = '/hubs/multiplayer-lobby'
+    let connection = {}
+    var RequestServerInformationInterval = {}
+    var RequestTicketStatusInterval = {}
+
+    //TEMP VARS
+    var currentTicketId = "";
+    var currentMatchId = "";
+    var isLeader = false;
+
+    //CONFIG PUZZLE
+    const titleId = 'E3820' // Playfab's game id
+    const buildId = '3de4c6e3-99ce-4553-8f62-f2fd4ad2a8e4' // Playfab's Server id
+    const queueName = 'puzzle_1v1_dev' // Playfab's queue name
+    const gameId = '0C4B4D9D-0351-45D7-87D5-F4ED377D3A40'
+    const teamSize = 2
+    const giveUpTime = 60 * 2 // Seconds to leave
+    const maxServerAttempts = 15;
+    const apiDelay = 6000;
+    const tournamentId = '556B7A92-C406-44A4-AC1B-08D97C4CF8C7'
+    var user = document.getElementById('userInput').value;
+    const tournamentType = 2
+    const escapedAttributes = "{\"MatchmakingRating\": 1200,\"Level\":1,\"GameId\":\"0C4B4D9D-0351-45D7-87D5-F4ED377D3A40\",\"TournamentId\":\"556B7A92-C406-44A4-AC1B-08D97C4CF8C7\"}";
+    const isRanking = false;
+
+    //CONFIG PUZZLE LADDER
+    /*
+    const titleId = 'E3820' // Playfab's game id
+    const buildId = '3de4c6e3-99ce-4553-8f62-f2fd4ad2a8e4' // Playfab's Server id
+    const queueName = 'puzzle_1v1_dev' // Playfab's queue name
+    const gameId = '0C4B4D9D-0351-45D7-87D5-F4ED377D3A40'
+    const teamSize = 2
+    const giveUpTime = 60 * 2 // Seconds to leave
+    const maxServerAttempts = 15;
+    const apiDelay = 6000;
+    const tournamentId = 'D0104973-DD7B-41DD-B03E-8B36231C652E'
+    var user = document.getElementById('userInput').value;
+    const tournamentType = 4
+    const escapedAttributes = "{\"MatchmakingRating\": 1200,\"Level\":1,\"GameId\":\"0C4B4D9D-0351-45D7-87D5-F4ED377D3A40\",\"TournamentId\":\"556B7A92-C406-44A4-AC1B-08D97C4CF8C7\"}";
+    const isRanking = true;
+    */
+
+    /**
+    * Disable buttons until connection is established
+    **/
+    document.getElementById('requestMatchButton').disabled = true;
+    document.getElementById('requestLogStreamButton').disabled = true;
+
+    const registerEvents = _ => {
+
+        connection.on('LogStreamEvent', (userId, payload) => {
+            //console.log(`[${userId}]: ${JSON.stringify(payload)}`)
+            //console.table([userId, payload]);
+            // Insight.create({tag: 'game-server'})
+            console.group(userId)
+            console.log(payload)
+            console.groupEnd()
+        })
+
+        connection.on('RealtimeEvent', (payload) => {
+            switch (payload.eventName) {
+
+                case 'GetaLobbyConnected':
+                    console.log('[GetaLobbyConnected]', payload);
+                break;
+
+                case 'RequestMatchmaking::TicketResponse':
+                    console.log('[TicketResponse]', payload);
+                    currentTicketId = payload.data.ticketId;
+
+                    RequestTicketStatusInterval = window.setInterval(_ => {
+                        GetTicketStatus();
+                    }, 6000);
+
+                break;
+
+                // Return the match status fired on microservices, pay attention in Status property, the possible values was
+                // - waitingForMatch
+                // - Cancelled: Timeout
+                // - Matched: Contains a list of members
+                case 'MatchmakingPolling::MatchStatus':
+                    console.log('[MatchmakingPolling::MatchStatus]', payload.data);
+
+                    if (payload.data.status.toLowerCase() == "matched") {
+                        currentMatchId = payload.data.matchId;
+                        clearInterval(RequestTicketStatusInterval);
+
+                        //Join to TeamGroup
+                        RequestJoinTeamGroup();
+                    }
+
+                    else if (payload.data.status.toLowerCase() == "canceled") {
+                        clearInterval(RequestTicketStatusInterval);
+                    }
+                break;
+
+                // Return the response when join in a group with other player
+                case 'JoinTeamGroup::Response':
+                    var usersInGroup = JSON.parse(payload.data.playersInGroup);
+                    usersInGroup.forEach(userInGroup => {
+                        if (userInGroup.UserId == user) {
+                            isLeader = userInGroup.IsLeader;
+                        }
+                    });
+                    console.log('[JoinTeamGroup::Response]', payload);
+                    console.log("IsLeader: ", isLeader);
+                break;
+
+                //Return the server information to create a multiplayer connection with URI and port
+                case 'ServerConnection::ServerInformation':
+                    console.log('[ServerInformation]', payload);
+                break;
+
+                // Return ServerConnection error
+                case 'ServerConnection::Error':
+                    console.log(`RealtimeEvent: [${payload.eventName}]`, payload.message);
+
+                    //Check if error is noServersAvailable and user isLeader of matchGroup
+                    if (payload.message.toLowerCase().indexOf("nohostsavailableinregion") != -1 && isLeader) {
+                        const payload = {
+                            TitleId: titleId,
+                            BuildId: buildId,
+                            MatchId: currentMatchId,
+                            UserId: user,
+                            ApiDelay: apiDelay,
+                            MaxServerAttempts: maxServerAttempts
+                        }
+
+                        console.log("Request new server from Playfab");
+                        connection.invoke('RequestPlayfabServer', JSON.stringify(payload)).catch(function (err) {
+                            return console.error(err.toString());
+                        });
+                    }
+                break;
+
+                // Is an standard error notifying when anything was wrong, the payload has all information about error
+                case 'RequestMatchmaking::Error':
+                case 'MatchmakingPolling::Error':
+                case 'JoinTeamGroup::Error':
+                case 'FightGroup::Error':
+                case 'RequestLeaderServerInformation::Error':
+                    console.log(`RealtimeEvent: [${payload.eventName}]`, payload.message);
+                break;
+
+                default:
+                    console.log(`RealtimeEvent: [${payload.eventName}]`, JSON.stringify(payload.data));
+                break;
+            }
+        })
+    }
+
+    const configConnection = _ => {
+        const user = document.getElementById('userInput').value;
+        connection = new signalR.HubConnectionBuilder()
+            .configureLogging(signalR.LogLevel.Debug)
+            .withUrl(`${baseUri}${hubUri}?userId=${user}&appContext=multiplayer-lobby`, {
+                skipNegotiation: true,
+                transport: signalR.HttpTransportType.WebSockets
+            })
+            .build();
+    }
+
+    const startConnection = _ => {
+        connection.start().then(function () {
+            document.getElementById('requestMatchButton').disabled = false;
+            document.getElementById('requestLogStreamButton').disabled = false;
+        }).catch(function (err) {
+            return console.error(err.toString());
+        });
+    }
+
+    // Create a connection
+    const serverConnect = _ => {
+        configConnection()//
+        registerEvents()
+        startConnection()//
+    }
+
+    //OnClick Event - Connect to lobby
+    const lobbyConnectionButtonOnClick = event => {
+        event.preventDefault();
+        serverConnect();
+    }
+
+    // //OnClick Event - Disconnect from lobby
+    // const lobbyDisconnectButtonOnClick = event => {
+    //     event.preventDefault();
+
+    //     //connection.connection.stopConnection();
+    //     connection.stop().then(function() {
+    //         document.getElementById('requestMatchButton').disabled = true;
+    //         document.getElementById('requestLogStreamButton').disabled = true;
+    //         console.log("Disconnected from lobby");
+    //     });
+    // }
+
+    // //Interval - Request ticket status
+    // const GetTicketStatus = _ => {
+
+    //     const payload = {
+    //         TitleId: titleId,
+    //         UserId: user,
+    //         TicketId: currentTicketId,
+    //         QueueName: queueName
+    //     }
+    //     // IMPORTANT!: The payload need to be serialized because the service receive a string data
+    //     connection.invoke('MatchmakingPolling', JSON.stringify(payload)).catch(function (err) {
+    //         return console.error(err.toString());
+    //     });
+    // }
+
+    // //Function - Request join to teamGroup
+    // const RequestJoinTeamGroup = _ => {
+
+    //     user = document.getElementById('userInput').value;
+
+    //     const matchmakingPayload = {
+    //         TitleId: titleId,
+    //         BuildId: buildId,
+    //         UserId: user,
+    //         GameId: gameId,
+    //         Timestamp: new Date,
+    //         TeamSize: teamSize,
+    //         Duration: 10,
+    //         GiveUpTime: giveUpTime,
+    //         QueueName: queueName,
+    //         TournamentId: tournamentId,
+    //         EscapedAttributes: escapedAttributes,
+    //         MaxServerAttempts: maxServerAttempts,
+    //         ApiDelay: apiDelay,
+    //         TournamentType: tournamentType
+    //     }
+
+    //     const ticketPayload = {
+    //         TicketId: currentTicketId,
+    //         QueueName: queueName,
+    //         MatchId: currentMatchId
+    //     }
+    //     // IMPORTANT!: The payload need to be serialized because the service receive a string data
+    //     connection.invoke('JoinTeamGroup', JSON.stringify(matchmakingPayload), JSON.stringify(ticketPayload)).catch(function (err) {
+    //         return console.error(err.toString());
+    //     });
+    // }
+
+    //OnClick Event - Start MatchMaking
+    const requestMatchButtonOnClick = event => {
+
+        user = document.getElementById('userInput').value;
+
+        const payload = {
+            TitleId: titleId,
+            BuildId: buildId,
+            UserId: user,
+            GameId: gameId,
+            Timestamp: new Date,
+            TeamSize: teamSize,
+            Duration: 10,
+            GiveUpTime: giveUpTime,
+            QueueName: queueName,
+            TournamentId: tournamentId,
+            EscapedAttributes: escapedAttributes,
+            MaxServerAttempts: maxServerAttempts,
+            ApiDelay: apiDelay,
+            TournamentType: tournamentType,
+            isRanking: isRanking
+        }
+        console.log('Sending ', payload);
+        // IMPORTANT!: The payload need to be serialized because the service receive a string data
+        connection.invoke('RequestMatchmaking', JSON.stringify(payload)).catch(function (err) {
+            return console.error(err.toString());
+        });
+        event.preventDefault();
+    }
+
+    // const requestLogStreamButtonOnClick = event => {
+    //     connection.invoke('SubscribeLogStream').catch(function (err) {
+    //         return console.error(err.toString());
+    //     });
+    //     event.preventDefault();
+    // }
+
+    /**
+    * Event definition
+    **/
+    document.getElementById('lobbyConnectionButton').addEventListener('click', lobbyConnectionButtonOnClick)
+    document.getElementById('requestMatchButton').addEventListener('click', requestMatchButtonOnClick);
+    document.getElementById('requestLogStreamButton').addEventListener('click', requestLogStreamButtonOnClick);
+    document.getElementById('lobbyDisconnectButton').addEventListener('click', lobbyDisconnectButtonOnClick);
+
+</script>
